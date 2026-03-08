@@ -18,6 +18,27 @@ function yToFreq(y, height) {
 }
 function timeToX(t, width, duration) { return (t / duration) * width; }
 
+// ── 線の「激しさ」を計算（点間の変化量の平均）
+function calcStrokeEnergy(strokes) {
+  let totalDelta = 0, count = 0;
+  strokes.forEach(stroke => {
+    for (let i = 1; i < stroke.points.length; i++) {
+      const dy = Math.abs(stroke.points[i].y - stroke.points[i - 1].y);
+      const dx = Math.abs(stroke.points[i].x - stroke.points[i - 1].x);
+      totalDelta += dy / (dx + 1);
+      count++;
+    }
+  });
+  return count === 0 ? 0.5 : Math.min(1, totalDelta / count / 3);
+}
+
+// ── ループ秒数と整数比で連動するLFO周期を返す
+function getLFOPeriod(duration, index) {
+  // 整数比: 1:1, 1:2, 1:3, 2:3, 1:4, 3:4
+  const ratios = [1, 2, 3, 1.5, 4, 0.75];
+  return duration / ratios[index % ratios.length];
+}
+
 const WAVEFORMS = [
   { type: "sine",     label: "正弦", symbol: "∿" },
   { type: "triangle", label: "三角", symbol: "△" },
@@ -35,60 +56,32 @@ const INITIAL_LAYERS = [
   makeLayer(3, "Voice 3", VOICE_COLORS[2]),
 ];
 
-// ── Pan knob component
+// ── Pan knob
 function PanKnob({ value, onChange, color }) {
   const startY = useRef(null);
   const startVal = useRef(null);
-
   const onMouseDown = (e) => {
     e.stopPropagation();
-    startY.current = e.clientY;
-    startVal.current = value;
-    const onMove = (ev) => {
-      const dy = startY.current - ev.clientY;
-      const next = Math.max(-1, Math.min(1, startVal.current + dy / 60));
-      onChange(Math.round(next * 100) / 100);
-    };
+    startY.current = e.clientY; startVal.current = value;
+    const onMove = (ev) => { const dy = startY.current - ev.clientY; onChange(Math.max(-1, Math.min(1, Math.round((startVal.current + dy / 60) * 100) / 100))); };
     const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mousemove", onMove); window.addEventListener("mouseup", onUp);
   };
-
   const onTouchStart = (e) => {
     e.stopPropagation();
-    startY.current = e.touches[0].clientY;
-    startVal.current = value;
-    const onMove = (ev) => {
-      const dy = startY.current - ev.touches[0].clientY;
-      const next = Math.max(-1, Math.min(1, startVal.current + dy / 60));
-      onChange(Math.round(next * 100) / 100);
-    };
+    startY.current = e.touches[0].clientY; startVal.current = value;
+    const onMove = (ev) => { const dy = startY.current - ev.touches[0].clientY; onChange(Math.max(-1, Math.min(1, Math.round((startVal.current + dy / 60) * 100) / 100))); };
     const onUp = () => { window.removeEventListener("touchmove", onMove); window.removeEventListener("touchend", onUp); };
-    window.addEventListener("touchmove", onMove, { passive: false });
-    window.addEventListener("touchend", onUp);
+    window.addEventListener("touchmove", onMove, { passive: false }); window.addEventListener("touchend", onUp);
   };
-
-  const angle = value * 135; // -135 to +135 degrees
+  const angle = value * 135;
   const label = value === 0 ? "C" : value < 0 ? `L${Math.round(-value * 100)}` : `R${Math.round(value * 100)}`;
-
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
-      <div style={{ fontSize: "7px", color: "#444", fontFamily: "'Share Tech Mono', monospace", letterSpacing: "1px" }}>PAN</div>
-      <div
-        onMouseDown={onMouseDown}
-        onTouchStart={onTouchStart}
-        onDoubleClick={e => { e.stopPropagation(); onChange(0); }}
-        title="ドラッグで調整 / ダブルクリックでセンターに戻す"
-        style={{ width: "28px", height: "28px", borderRadius: "50%", background: "#111", border: `2px solid ${value === 0 ? "#2a2a2a" : color}`, cursor: "ns-resize", position: "relative", flexShrink: 0, boxShadow: value !== 0 ? `0 0 6px ${color}44` : "none" }}>
-        <div style={{
-          position: "absolute", top: "50%", left: "50%",
-          width: "2px", height: "10px",
-          background: value === 0 ? "#444" : color,
-          borderRadius: "1px",
-          transformOrigin: "50% 100%",
-          transform: `translate(-50%, -100%) rotate(${angle}deg)`,
-          transition: "background 0.15s"
-        }} />
+      <div style={{ fontSize: "7px", color: "#444", fontFamily: "'Share Tech Mono', monospace" }}>PAN</div>
+      <div onMouseDown={onMouseDown} onTouchStart={onTouchStart} onDoubleClick={e => { e.stopPropagation(); onChange(0); }}
+        style={{ width: "28px", height: "28px", borderRadius: "50%", background: "#111", border: `2px solid ${value === 0 ? "#2a2a2a" : color}`, cursor: "ns-resize", position: "relative", boxShadow: value !== 0 ? `0 0 6px ${color}44` : "none" }}>
+        <div style={{ position: "absolute", top: "50%", left: "50%", width: "2px", height: "10px", background: value === 0 ? "#444" : color, borderRadius: "1px", transformOrigin: "50% 100%", transform: `translate(-50%, -100%) rotate(${angle}deg)` }} />
       </div>
       <div style={{ fontSize: "7px", color: value === 0 ? "#444" : color, fontFamily: "'Share Tech Mono', monospace" }}>{label}</div>
     </div>
@@ -104,6 +97,8 @@ export default function GraphicScore() {
   const playingRef = useRef(false);
   const durationRef = useRef(DEFAULT_DURATION);
   const volumeRef = useRef(0.5);
+  const lfoSensRef = useRef(0);         // 0〜1: LFO感度グローバル
+  const voiceTraitsRef = useRef({});    // layerId → { energy, period, phase, depth }
   const sizeRef = useRef({ w: 800, h: 400 });
   const layersRef = useRef(INITIAL_LAYERS);
   const activeLayerIdRef = useRef(1);
@@ -117,13 +112,22 @@ export default function GraphicScore() {
   const [tool, setTool] = useState("pen");
   const [showGrid, setShowGrid] = useState(true);
   const [volume, setVolume] = useState(0.5);
+  const [lfoSens, setLfoSens] = useState(0);
   const [size, setSize] = useState({ w: 800, h: 400 });
-  const [savedSlots, setSavedSlots] = useState([null, null, null]);
   const containerRef = useRef(null);
   const fileInputRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
+  const recTimerRef = useRef(null);
+
+  const [recording, setRecording] = useState(false);
+  const [recDuration, setRecDuration] = useState(60); // 秒
+  const [recRemaining, setRecRemaining] = useState(0);
+  const destNodeRef = useRef(null);
 
   useEffect(() => { durationRef.current = duration; }, [duration]);
   useEffect(() => { volumeRef.current = volume; }, [volume]);
+  useEffect(() => { lfoSensRef.current = lfoSens; }, [lfoSens]);
   useEffect(() => { sizeRef.current = size; }, [size]);
   useEffect(() => { layersRef.current = layers; }, [layers]);
   useEffect(() => { activeLayerIdRef.current = activeLayerId; }, [activeLayerId]);
@@ -135,6 +139,23 @@ export default function GraphicScore() {
     });
     if (containerRef.current) ro.observe(containerRef.current);
     return () => ro.disconnect();
+  }, []);
+
+  // ── 各ボイスの個性（LFO特性）を計算・キャッシュ
+  const computeVoiceTraits = useCallback(() => {
+    const traits = {};
+    layersRef.current.forEach((layer, i) => {
+      const energy = calcStrokeEnergy(layer.strokes); // 0〜1: 線の激しさ
+      const period = getLFOPeriod(durationRef.current, i);
+      // 位相はボイスごとにずらす（ランダム性だが再現性あり）
+      const phase = (i * 0.618) % 1; // 黄金角で分散
+      // 深さは「激しい線 = 大きく揺れる」
+      const depth = 0.3 + energy * 0.7;
+      // 慣性（感応の遅さ）は「穏やかな線 = ゆっくり反応」
+      const inertia = 0.02 + (1 - energy) * 0.08;
+      traits[layer.id] = { energy, period, phase, depth, inertia };
+    });
+    voiceTraitsRef.current = traits;
   }, []);
 
   const redraw = useCallback(() => {
@@ -193,8 +214,7 @@ export default function GraphicScore() {
     const pos = getPos(e, canvasRef.current);
     const newStroke = { id: Date.now(), points: [pos] };
     setLayers(prev => {
-      const next = prev.map(l => l.id === activeLayerIdRef.current
-        ? { ...l, strokes: [...l.strokes, newStroke] } : l);
+      const next = prev.map(l => l.id === activeLayerIdRef.current ? { ...l, strokes: [...l.strokes, newStroke] } : l);
       layersRef.current = next;
       return next;
     });
@@ -210,10 +230,7 @@ export default function GraphicScore() {
         if (l.id !== activeLayerIdRef.current) return l;
         const strokes = [...l.strokes];
         if (!strokes.length) return l;
-        strokes[strokes.length - 1] = {
-          ...strokes[strokes.length - 1],
-          points: [...strokes[strokes.length - 1].points, pos]
-        };
+        strokes[strokes.length - 1] = { ...strokes[strokes.length - 1], points: [...strokes[strokes.length - 1].points, pos] };
         return { ...l, strokes };
       });
       layersRef.current = next;
@@ -230,8 +247,7 @@ export default function GraphicScore() {
     const r = 24;
     setLayers(prev => {
       const next = prev.map(l => l.id === activeLayerIdRef.current
-        ? { ...l, strokes: l.strokes.filter(s => !s.points.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < r)) }
-        : l);
+        ? { ...l, strokes: l.strokes.filter(s => !s.points.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < r)) } : l);
       layersRef.current = next;
       return next;
     });
@@ -253,7 +269,24 @@ export default function GraphicScore() {
     return bestDist > (w / durationRef.current) * 0.5 ? null : bestFreq;
   }, []);
 
-  // ── Audio: create osc + gain + panner per voice
+  // ── LFOオフセットを計算（各ボイス固有の周期・位相・深さ）
+  const getLFOOffset = useCallback((layerId, elapsed) => {
+    const sens = lfoSensRef.current;
+    if (sens === 0) return 0;
+    const traits = voiceTraitsRef.current[layerId];
+    if (!traits) return 0;
+    const { period, phase, depth } = traits;
+    // サイン波LFO（位相をボイスごとにずらす）
+    const lfo = Math.sin((elapsed / period + phase) * Math.PI * 2);
+    // semitone単位のオフセット（最大±24半音）
+    return lfo * depth * sens * 24;
+  }, []);
+
+  // ── 音程にLFOオフセット（半音単位）を加える
+  const applyLFO = (freq, semiOffset) => {
+    return freq * Math.pow(2, semiOffset / 12);
+  };
+
   const startPlay = useCallback(() => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
@@ -262,6 +295,13 @@ export default function GraphicScore() {
 
     Object.values(oscsRef.current).forEach(({ osc }) => { try { osc.stop(); } catch (e) {} });
     oscsRef.current = {};
+
+    // ボイスの個性を計算
+    computeVoiceTraits();
+
+    // 録音用 MediaStreamDestination
+    const dest = ctx.createMediaStreamDestination();
+    destNodeRef.current = dest;
 
     layersRef.current.forEach(layer => {
       const osc = ctx.createOscillator();
@@ -273,6 +313,7 @@ export default function GraphicScore() {
       osc.connect(gain);
       gain.connect(panner);
       panner.connect(ctx.destination);
+      panner.connect(dest); // 録音にも流す
       osc.start();
       oscsRef.current[layer.id] = { osc, gain, panner };
     });
@@ -288,15 +329,21 @@ export default function GraphicScore() {
 
       const activeLayers = layersRef.current.filter(l => !l.muted);
       const perVol = volumeRef.current / Math.max(1, activeLayers.length);
+      const traits = voiceTraitsRef.current;
 
       layersRef.current.forEach(layer => {
         const voice = oscsRef.current[layer.id];
         if (!voice) return;
-        // update pan in realtime
         voice.panner.pan.setTargetAtTime(layer.pan || 0, ctx.currentTime, 0.05);
-        const freq = getFreqAtTime(layer.id, elapsed);
-        if (freq) {
-          voice.osc.frequency.setTargetAtTime(freq, ctx.currentTime, 0.008);
+
+        const baseFreq = getFreqAtTime(layer.id, elapsed);
+        if (baseFreq) {
+          // LFOオフセットを加算
+          const lfoOffset = getLFOOffset(layer.id, elapsed);
+          const finalFreq = applyLFO(baseFreq, lfoOffset);
+          // 慣性（ボイスごとに異なる追従速度）
+          const inertia = traits[layer.id]?.inertia || 0.05;
+          voice.osc.frequency.setTargetAtTime(finalFreq, ctx.currentTime, inertia);
           voice.gain.gain.setTargetAtTime(perVol, ctx.currentTime, 0.01);
         } else {
           voice.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.02);
@@ -306,7 +353,7 @@ export default function GraphicScore() {
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
-  }, [getFreqAtTime]);
+  }, [getFreqAtTime, getLFOOffset, computeVoiceTraits]);
 
   const stopPlay = useCallback(() => {
     playingRef.current = false;
@@ -326,51 +373,84 @@ export default function GraphicScore() {
     else { startPlay(); setPlaying(true); }
   };
 
-  // ── Layer ops
+  // ── 録音開始
+  const startRecording = useCallback(() => {
+    // まず再生開始（していなければ）
+    if (!playingRef.current) { startPlay(); setPlaying(true); }
+
+    const dest = destNodeRef.current;
+    if (!dest) return;
+
+    recordedChunksRef.current = [];
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus" : "audio/webm";
+
+    const mr = new MediaRecorder(dest.stream, { mimeType });
+    mr.ondataavailable = e => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
+    mr.onstop = () => {
+      const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `graphic-score-${Date.now()}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    mr.start(100);
+    mediaRecorderRef.current = mr;
+    setRecording(true);
+    setRecRemaining(recDuration);
+
+    // カウントダウン
+    let remaining = recDuration;
+    recTimerRef.current = setInterval(() => {
+      remaining -= 1;
+      setRecRemaining(remaining);
+      if (remaining <= 0) stopRecording();
+    }, 1000);
+  }, [recDuration, startPlay]);
+
+  // ── 録音停止
+  const stopRecording = useCallback(() => {
+    clearInterval(recTimerRef.current);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    setRecording(false);
+    setRecRemaining(0);
+  }, []);
+
   const addLayer = () => {
     if (layers.length >= VOICE_COLORS.length) return;
     const id = Date.now();
-    const newLayer = makeLayer(id, `Voice ${layers.length + 1}`, VOICE_COLORS[layers.length]);
-    setLayers(prev => [...prev, newLayer]);
+    setLayers(prev => [...prev, makeLayer(id, `Voice ${prev.length + 1}`, VOICE_COLORS[prev.length])]);
     setActiveLayerId(id);
   };
 
   const removeLayer = (id) => {
     if (layers.length <= 1) return;
-    setLayers(prev => {
-      const next = prev.filter(l => l.id !== id);
-      if (activeLayerId === id) setActiveLayerId(next[0].id);
-      return next;
-    });
+    setLayers(prev => { const next = prev.filter(l => l.id !== id); if (activeLayerId === id) setActiveLayerId(next[0].id); return next; });
   };
 
   const toggleMute = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, muted: !l.muted } : l));
   const clearLayer = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, strokes: [] } : l));
   const setWaveform = (id, wf) => setLayers(prev => prev.map(l => l.id === id ? { ...l, waveform: wf } : l));
   const setPan = (id, pan) => {
-    setLayers(prev => {
-      const next = prev.map(l => l.id === id ? { ...l, pan } : l);
-      layersRef.current = next;
-      return next;
-    });
+    setLayers(prev => { const next = prev.map(l => l.id === id ? { ...l, pan } : l); layersRef.current = next; return next; });
   };
   const clearAll = () => { stopPlay(); setPlaying(false); setLayers(prev => prev.map(l => ({ ...l, strokes: [] }))); setPlayhead(0); };
 
-  // ── Save / Load
   const saveToFile = () => {
-    const data = { version: 1, duration, layers };
+    const data = { version: 2, duration, layers };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `graphic-score-${Date.now()}.json`;
-    a.click();
+    const a = document.createElement("a"); a.href = url; a.download = `graphic-score-${Date.now()}.json`; a.click();
     URL.revokeObjectURL(url);
   };
 
   const loadFromFile = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+    const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
@@ -383,12 +463,29 @@ export default function GraphicScore() {
         }
       } catch (err) { alert("読み込みに失敗しました"); }
     };
-    reader.readAsText(file);
-    e.target.value = "";
+    reader.readAsText(file); e.target.value = "";
   };
 
   const activeLayer = layers.find(l => l.id === activeLayerId);
   const accentColor = activeLayer?.color || "#00e5ff";
+
+  // LFOインジケーター（再生中の各ボイスの揺れ量を可視化）
+  const [lfoIndicators, setLfoIndicators] = useState({});
+  useEffect(() => {
+    if (!playing || lfoSens === 0) { setLfoIndicators({}); return; }
+    const id = setInterval(() => {
+      const elapsed = audioCtxRef.current ? (audioCtxRef.current.currentTime - startTimeRef.current) % durationRef.current : 0;
+      const indicators = {};
+      layersRef.current.forEach(layer => {
+        const traits = voiceTraitsRef.current[layer.id];
+        if (!traits) return;
+        const lfo = Math.sin((elapsed / traits.period + traits.phase) * Math.PI * 2);
+        indicators[layer.id] = lfo * traits.depth * lfoSens;
+      });
+      setLfoIndicators(indicators);
+    }, 50);
+    return () => clearInterval(id);
+  }, [playing, lfoSens]);
 
   return (
     <>
@@ -396,6 +493,7 @@ export default function GraphicScore() {
         @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=DM+Sans:wght@400;500;600&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background: #080808; overflow: hidden; }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.2; } }
       `}</style>
 
       <input ref={fileInputRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadFromFile} />
@@ -434,7 +532,18 @@ export default function GraphicScore() {
             <span style={{ fontSize: "9px", color: "#444", fontFamily: "'Share Tech Mono', monospace" }}>VOL</span>
             <input type="range" min="0" max="1" step="0.01" value={volume}
               onChange={e => { setVolume(Number(e.target.value)); volumeRef.current = Number(e.target.value); }}
-              style={{ width: "60px", accentColor: "#00e5ff" }} />
+              style={{ width: "55px", accentColor: "#00e5ff" }} />
+          </div>
+
+          {/* LFO SENS — メインコントロール */}
+          <div style={{ display: "flex", alignItems: "center", gap: "5px", padding: "4px 10px", borderRadius: "8px", border: `1px solid ${lfoSens > 0 ? "#ff922b44" : "#2a2a2a"}`, background: lfoSens > 0 ? "#ff922b08" : "transparent", transition: "all 0.3s" }}>
+            <span style={{ fontSize: "9px", color: lfoSens > 0 ? "#ff922b" : "#444", fontFamily: "'Share Tech Mono', monospace", letterSpacing: "1px", transition: "color 0.3s" }}>LFO SENS</span>
+            <input type="range" min="0" max="1" step="0.01" value={lfoSens}
+              onChange={e => setLfoSens(Number(e.target.value))}
+              style={{ width: "70px", accentColor: "#ff922b" }} />
+            <span style={{ fontSize: "9px", color: lfoSens > 0 ? "#ff922b" : "#333", fontFamily: "'Share Tech Mono', monospace", minWidth: "24px" }}>
+              {Math.round(lfoSens * 100)}
+            </span>
           </div>
 
           <button onClick={() => setShowGrid(g => !g)}
@@ -442,7 +551,36 @@ export default function GraphicScore() {
             GRID
           </button>
 
-          {/* Save / Load */}
+          {/* REC コントロール */}
+          <div style={{ display: "flex", alignItems: "center", gap: "4px", padding: "4px 8px", borderRadius: "8px", border: `1px solid ${recording ? "#ff4d6d88" : "#2a2a2a"}`, background: recording ? "#ff4d6d0a" : "transparent", transition: "all 0.3s" }}>
+            {!recording ? (
+              <>
+                <span style={{ fontSize: "9px", color: "#555", fontFamily: "'Share Tech Mono', monospace" }}>REC</span>
+                {[60, 180, 300, 600].map(s => (
+                  <button key={s} onClick={() => setRecDuration(s)}
+                    style={{ padding: "2px 5px", borderRadius: "4px", border: "1px solid", borderColor: recDuration === s ? "#ff4d6d" : "#2a2a2a", background: recDuration === s ? "#ff4d6d15" : "transparent", color: recDuration === s ? "#ff4d6d" : "#444", cursor: "pointer", fontFamily: "'Share Tech Mono', monospace", fontSize: "9px" }}>
+                    {s >= 60 ? `${s / 60}m` : `${s}s`}
+                  </button>
+                ))}
+                <button onClick={startRecording}
+                  style={{ padding: "3px 9px", borderRadius: "5px", border: "none", background: "#ff4d6d", color: "#fff", fontWeight: "700", cursor: "pointer", fontSize: "10px", fontFamily: "inherit" }}>
+                  ● REC
+                </button>
+              </>
+            ) : (
+              <>
+                <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: "#ff4d6d", animation: "pulse 1s infinite" }} />
+                <span style={{ fontSize: "10px", color: "#ff4d6d", fontFamily: "'Share Tech Mono', monospace", minWidth: "36px" }}>
+                  {Math.floor(recRemaining / 60)}:{String(recRemaining % 60).padStart(2, "0")}
+                </span>
+                <button onClick={stopRecording}
+                  style={{ padding: "3px 9px", borderRadius: "5px", border: "1px solid #ff4d6d", background: "transparent", color: "#ff4d6d", cursor: "pointer", fontSize: "10px", fontFamily: "inherit" }}>
+                  ■ STOP
+                </button>
+              </>
+            )}
+          </div>
+
           <div style={{ display: "flex", gap: "4px", marginLeft: "auto" }}>
             <button onClick={saveToFile}
               style={{ padding: "4px 10px", borderRadius: "6px", border: "1px solid #2a2a2a", background: "transparent", color: "#00e5ff", cursor: "pointer", fontSize: "10px", fontFamily: "'Share Tech Mono', monospace" }}>
@@ -469,37 +607,41 @@ export default function GraphicScore() {
 
             {layers.map(layer => {
               const isActive = layer.id === activeLayerId;
+              const lfoInd = lfoIndicators[layer.id] || 0;
               return (
                 <div key={layer.id} onClick={() => setActiveLayerId(layer.id)}
                   style={{ borderRadius: "7px", border: `1px solid ${isActive ? layer.color + "88" : "#1a1a1a"}`, background: isActive ? layer.color + "12" : "transparent", padding: "6px 7px", cursor: "pointer", transition: "all 0.15s" }}>
 
-                  {/* Name */}
-                  <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "6px" }}>
-                    <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: layer.muted ? "#333" : layer.color, flexShrink: 0 }} />
+                  <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "5px" }}>
+                    <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: layer.muted ? "#333" : layer.color, flexShrink: 0,
+                      boxShadow: lfoInd !== 0 ? `0 0 ${Math.abs(lfoInd) * 8}px ${layer.color}` : "none", transition: "box-shadow 0.05s" }} />
                     <span style={{ fontSize: "10px", color: isActive ? "#fff" : "#555", fontWeight: isActive ? "600" : "400", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{layer.label}</span>
                   </div>
 
-                  {/* Waveform + Pan — active only */}
+                  {/* LFOインジケーターバー */}
+                  {lfoSens > 0 && (
+                    <div style={{ height: "2px", background: "#1a1a1a", borderRadius: "1px", marginBottom: "5px", overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${Math.abs(lfoInd) * 100}%`, background: layer.color, marginLeft: lfoInd < 0 ? `${(1 + lfoInd) * 100}%` : "50%", transition: "all 0.05s", opacity: 0.8 }} />
+                    </div>
+                  )}
+
                   {isActive && (
                     <>
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px", marginBottom: "6px" }}>
                         {WAVEFORMS.map(wf => (
                           <button key={wf.type} onClick={e => { e.stopPropagation(); setWaveform(layer.id, wf.type); }}
-                            title={wf.label}
                             style={{ padding: "3px 0", fontSize: "11px", border: "1px solid", borderColor: layer.waveform === wf.type ? layer.color : "#222", borderRadius: "4px", background: layer.waveform === wf.type ? layer.color + "22" : "transparent", color: layer.waveform === wf.type ? layer.color : "#444", cursor: "pointer" }}>
                             {wf.symbol}
                           </button>
                         ))}
                       </div>
 
-                      {/* Pan knob */}
                       <div style={{ display: "flex", justifyContent: "center", marginBottom: "6px" }} onClick={e => e.stopPropagation()}>
                         <PanKnob value={layer.pan || 0} onChange={v => setPan(layer.id, v)} color={layer.color} />
                       </div>
                     </>
                   )}
 
-                  {/* Mute / Clear / Remove */}
                   <div style={{ display: "flex", gap: "3px" }}>
                     <button onClick={e => { e.stopPropagation(); toggleMute(layer.id); }}
                       style={{ flex: 1, padding: "2px 0", fontSize: "8px", border: "1px solid #222", borderRadius: "3px", background: layer.muted ? "#333" : "transparent", color: layer.muted ? "#fff" : "#444", cursor: "pointer", fontFamily: "inherit" }}>
