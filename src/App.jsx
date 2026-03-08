@@ -24,12 +24,76 @@ const WAVEFORMS = [
   { type: "sawtooth", label: "鋸歯", symbol: "╱" },
   { type: "square",   label: "矩形", symbol: "□" },
 ];
-const makeLayer = (id, label, color) => ({ id, label, color, strokes: [], muted: false, waveform: "sine" });
+
+const makeLayer = (id, label, color) => ({
+  id, label, color, strokes: [], muted: false, waveform: "sine", pan: 0
+});
+
 const INITIAL_LAYERS = [
   makeLayer(1, "Voice 1", VOICE_COLORS[0]),
   makeLayer(2, "Voice 2", VOICE_COLORS[1]),
   makeLayer(3, "Voice 3", VOICE_COLORS[2]),
 ];
+
+// ── Pan knob component
+function PanKnob({ value, onChange, color }) {
+  const startY = useRef(null);
+  const startVal = useRef(null);
+
+  const onMouseDown = (e) => {
+    e.stopPropagation();
+    startY.current = e.clientY;
+    startVal.current = value;
+    const onMove = (ev) => {
+      const dy = startY.current - ev.clientY;
+      const next = Math.max(-1, Math.min(1, startVal.current + dy / 60));
+      onChange(Math.round(next * 100) / 100);
+    };
+    const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const onTouchStart = (e) => {
+    e.stopPropagation();
+    startY.current = e.touches[0].clientY;
+    startVal.current = value;
+    const onMove = (ev) => {
+      const dy = startY.current - ev.touches[0].clientY;
+      const next = Math.max(-1, Math.min(1, startVal.current + dy / 60));
+      onChange(Math.round(next * 100) / 100);
+    };
+    const onUp = () => { window.removeEventListener("touchmove", onMove); window.removeEventListener("touchend", onUp); };
+    window.addEventListener("touchmove", onMove, { passive: false });
+    window.addEventListener("touchend", onUp);
+  };
+
+  const angle = value * 135; // -135 to +135 degrees
+  const label = value === 0 ? "C" : value < 0 ? `L${Math.round(-value * 100)}` : `R${Math.round(value * 100)}`;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
+      <div style={{ fontSize: "7px", color: "#444", fontFamily: "'Share Tech Mono', monospace", letterSpacing: "1px" }}>PAN</div>
+      <div
+        onMouseDown={onMouseDown}
+        onTouchStart={onTouchStart}
+        onDoubleClick={e => { e.stopPropagation(); onChange(0); }}
+        title="ドラッグで調整 / ダブルクリックでセンターに戻す"
+        style={{ width: "28px", height: "28px", borderRadius: "50%", background: "#111", border: `2px solid ${value === 0 ? "#2a2a2a" : color}`, cursor: "ns-resize", position: "relative", flexShrink: 0, boxShadow: value !== 0 ? `0 0 6px ${color}44` : "none" }}>
+        <div style={{
+          position: "absolute", top: "50%", left: "50%",
+          width: "2px", height: "10px",
+          background: value === 0 ? "#444" : color,
+          borderRadius: "1px",
+          transformOrigin: "50% 100%",
+          transform: `translate(-50%, -100%) rotate(${angle}deg)`,
+          transition: "background 0.15s"
+        }} />
+      </div>
+      <div style={{ fontSize: "7px", color: value === 0 ? "#444" : color, fontFamily: "'Share Tech Mono', monospace" }}>{label}</div>
+    </div>
+  );
+}
 
 export default function GraphicScore() {
   const canvasRef = useRef(null);
@@ -54,7 +118,9 @@ export default function GraphicScore() {
   const [showGrid, setShowGrid] = useState(true);
   const [volume, setVolume] = useState(0.5);
   const [size, setSize] = useState({ w: 800, h: 400 });
+  const [savedSlots, setSavedSlots] = useState([null, null, null]);
   const containerRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => { durationRef.current = duration; }, [duration]);
   useEffect(() => { volumeRef.current = volume; }, [volume]);
@@ -187,6 +253,7 @@ export default function GraphicScore() {
     return bestDist > (w / durationRef.current) * 0.5 ? null : bestFreq;
   }, []);
 
+  // ── Audio: create osc + gain + panner per voice
   const startPlay = useCallback(() => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
@@ -199,12 +266,15 @@ export default function GraphicScore() {
     layersRef.current.forEach(layer => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
+      const panner = ctx.createStereoPanner();
       osc.type = layer.waveform || "sine";
       gain.gain.value = 0;
+      panner.pan.value = layer.pan || 0;
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(panner);
+      panner.connect(ctx.destination);
       osc.start();
-      oscsRef.current[layer.id] = { osc, gain };
+      oscsRef.current[layer.id] = { osc, gain, panner };
     });
 
     startTimeRef.current = ctx.currentTime;
@@ -222,6 +292,8 @@ export default function GraphicScore() {
       layersRef.current.forEach(layer => {
         const voice = oscsRef.current[layer.id];
         if (!voice) return;
+        // update pan in realtime
+        voice.panner.pan.setTargetAtTime(layer.pan || 0, ctx.currentTime, 0.05);
         const freq = getFreqAtTime(layer.id, elapsed);
         if (freq) {
           voice.osc.frequency.setTargetAtTime(freq, ctx.currentTime, 0.008);
@@ -254,6 +326,7 @@ export default function GraphicScore() {
     else { startPlay(); setPlaying(true); }
   };
 
+  // ── Layer ops
   const addLayer = () => {
     if (layers.length >= VOICE_COLORS.length) return;
     const id = Date.now();
@@ -274,7 +347,45 @@ export default function GraphicScore() {
   const toggleMute = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, muted: !l.muted } : l));
   const clearLayer = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, strokes: [] } : l));
   const setWaveform = (id, wf) => setLayers(prev => prev.map(l => l.id === id ? { ...l, waveform: wf } : l));
+  const setPan = (id, pan) => {
+    setLayers(prev => {
+      const next = prev.map(l => l.id === id ? { ...l, pan } : l);
+      layersRef.current = next;
+      return next;
+    });
+  };
   const clearAll = () => { stopPlay(); setPlaying(false); setLayers(prev => prev.map(l => ({ ...l, strokes: [] }))); setPlayhead(0); };
+
+  // ── Save / Load
+  const saveToFile = () => {
+    const data = { version: 1, duration, layers };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `graphic-score-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const loadFromFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (data.layers) {
+          stopPlay(); setPlaying(false);
+          setLayers(data.layers);
+          if (data.duration) { setDuration(data.duration); durationRef.current = data.duration; }
+          setActiveLayerId(data.layers[0].id);
+        }
+      } catch (err) { alert("読み込みに失敗しました"); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
 
   const activeLayer = layers.find(l => l.id === activeLayerId);
   const accentColor = activeLayer?.color || "#00e5ff";
@@ -286,6 +397,8 @@ export default function GraphicScore() {
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background: #080808; overflow: hidden; }
       `}</style>
+
+      <input ref={fileInputRef} type="file" accept=".json" style={{ display: "none" }} onChange={loadFromFile} />
 
       <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#080808", fontFamily: "'DM Sans', sans-serif", color: "#fff" }}>
 
@@ -317,7 +430,7 @@ export default function GraphicScore() {
             ))}
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "5px", marginLeft: "auto" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
             <span style={{ fontSize: "9px", color: "#444", fontFamily: "'Share Tech Mono', monospace" }}>VOL</span>
             <input type="range" min="0" max="1" step="0.01" value={volume}
               onChange={e => { setVolume(Number(e.target.value)); volumeRef.current = Number(e.target.value); }}
@@ -328,6 +441,19 @@ export default function GraphicScore() {
             style={{ padding: "4px 8px", borderRadius: "6px", border: "1px solid #2a2a2a", background: "transparent", color: showGrid ? "#555" : "#2a2a2a", cursor: "pointer", fontSize: "10px" }}>
             GRID
           </button>
+
+          {/* Save / Load */}
+          <div style={{ display: "flex", gap: "4px", marginLeft: "auto" }}>
+            <button onClick={saveToFile}
+              style={{ padding: "4px 10px", borderRadius: "6px", border: "1px solid #2a2a2a", background: "transparent", color: "#00e5ff", cursor: "pointer", fontSize: "10px", fontFamily: "'Share Tech Mono', monospace" }}>
+              ↓ SAVE
+            </button>
+            <button onClick={() => fileInputRef.current.click()}
+              style={{ padding: "4px 10px", borderRadius: "6px", border: "1px solid #2a2a2a", background: "transparent", color: "#a8ff3e", cursor: "pointer", fontSize: "10px", fontFamily: "'Share Tech Mono', monospace" }}>
+              ↑ LOAD
+            </button>
+          </div>
+
           <button onClick={clearAll}
             style={{ padding: "4px 8px", borderRadius: "6px", border: "1px solid #2a2a2a", background: "transparent", color: "#555", cursor: "pointer", fontSize: "10px" }}>
             CLEAR
@@ -338,7 +464,7 @@ export default function GraphicScore() {
         <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
           {/* Voice panel */}
-          <div style={{ width: "100px", flexShrink: 0, background: "#0a0a0a", borderRight: "1px solid #1a1a1a", display: "flex", flexDirection: "column", padding: "8px 6px", gap: "5px", overflowY: "auto" }}>
+          <div style={{ width: "110px", flexShrink: 0, background: "#0a0a0a", borderRight: "1px solid #1a1a1a", display: "flex", flexDirection: "column", padding: "8px 6px", gap: "5px", overflowY: "auto" }}>
             <div style={{ fontSize: "8px", color: "#333", letterSpacing: "2px", fontFamily: "'Share Tech Mono', monospace", marginBottom: "2px" }}>VOICES</div>
 
             {layers.map(layer => {
@@ -346,22 +472,34 @@ export default function GraphicScore() {
               return (
                 <div key={layer.id} onClick={() => setActiveLayerId(layer.id)}
                   style={{ borderRadius: "7px", border: `1px solid ${isActive ? layer.color + "88" : "#1a1a1a"}`, background: isActive ? layer.color + "12" : "transparent", padding: "6px 7px", cursor: "pointer", transition: "all 0.15s" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "4px" }}>
+
+                  {/* Name */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "6px" }}>
                     <div style={{ width: "7px", height: "7px", borderRadius: "50%", background: layer.muted ? "#333" : layer.color, flexShrink: 0 }} />
                     <span style={{ fontSize: "10px", color: isActive ? "#fff" : "#555", fontWeight: isActive ? "600" : "400", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{layer.label}</span>
                   </div>
-                  {/* Waveform selector — active layer only */}
+
+                  {/* Waveform + Pan — active only */}
                   {isActive && (
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px", marginBottom: "4px" }}>
-                      {WAVEFORMS.map(wf => (
-                        <button key={wf.type} onClick={e => { e.stopPropagation(); setWaveform(layer.id, wf.type); }}
-                          title={wf.label}
-                          style={{ padding: "3px 0", fontSize: "11px", border: "1px solid", borderColor: layer.waveform === wf.type ? layer.color : "#222", borderRadius: "4px", background: layer.waveform === wf.type ? layer.color + "22" : "transparent", color: layer.waveform === wf.type ? layer.color : "#444", cursor: "pointer" }}>
-                          {wf.symbol}
-                        </button>
-                      ))}
-                    </div>
+                    <>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px", marginBottom: "6px" }}>
+                        {WAVEFORMS.map(wf => (
+                          <button key={wf.type} onClick={e => { e.stopPropagation(); setWaveform(layer.id, wf.type); }}
+                            title={wf.label}
+                            style={{ padding: "3px 0", fontSize: "11px", border: "1px solid", borderColor: layer.waveform === wf.type ? layer.color : "#222", borderRadius: "4px", background: layer.waveform === wf.type ? layer.color + "22" : "transparent", color: layer.waveform === wf.type ? layer.color : "#444", cursor: "pointer" }}>
+                            {wf.symbol}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Pan knob */}
+                      <div style={{ display: "flex", justifyContent: "center", marginBottom: "6px" }} onClick={e => e.stopPropagation()}>
+                        <PanKnob value={layer.pan || 0} onChange={v => setPan(layer.id, v)} color={layer.color} />
+                      </div>
+                    </>
                   )}
+
+                  {/* Mute / Clear / Remove */}
                   <div style={{ display: "flex", gap: "3px" }}>
                     <button onClick={e => { e.stopPropagation(); toggleMute(layer.id); }}
                       style={{ flex: 1, padding: "2px 0", fontSize: "8px", border: "1px solid #222", borderRadius: "3px", background: layer.muted ? "#333" : "transparent", color: layer.muted ? "#fff" : "#444", cursor: "pointer", fontFamily: "inherit" }}>
@@ -430,9 +568,9 @@ export default function GraphicScore() {
         </div>
 
         {/* Time axis */}
-        <div style={{ height: "20px", borderTop: "1px solid #1a1a1a", background: "#0c0c0c", position: "relative", paddingLeft: "136px" }}>
+        <div style={{ height: "20px", borderTop: "1px solid #1a1a1a", background: "#0c0c0c", position: "relative", paddingLeft: "146px" }}>
           {Array.from({ length: duration + 1 }).map((_, i) => (
-            <div key={i} style={{ position: "absolute", left: `calc(136px + ${(i / duration) * 100}%)`, fontSize: "7px", color: "#333", fontFamily: "'Share Tech Mono', monospace", transform: "translateX(-50%)", top: "4px" }}>
+            <div key={i} style={{ position: "absolute", left: `calc(146px + ${(i / duration) * 100}%)`, fontSize: "7px", color: "#333", fontFamily: "'Share Tech Mono', monospace", transform: "translateX(-50%)", top: "4px" }}>
               {i}s
             </div>
           ))}
