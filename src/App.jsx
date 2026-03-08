@@ -47,7 +47,7 @@ const WAVEFORMS = [
 ];
 
 const makeLayer = (id, label, color) => ({
-  id, label, color, strokes: [], muted: false, waveform: "sine", pan: 0
+  id, label, color, strokes: [], muted: false, waveform: "sine", pan: 0, filterOn: false
 });
 
 const INITIAL_LAYERS = [
@@ -145,15 +145,20 @@ export default function GraphicScore() {
   const computeVoiceTraits = useCallback(() => {
     const traits = {};
     layersRef.current.forEach((layer, i) => {
-      const energy = calcStrokeEnergy(layer.strokes); // 0〜1: 線の激しさ
+      const energy = calcStrokeEnergy(layer.strokes);
       const period = getLFOPeriod(durationRef.current, i);
-      // 位相はボイスごとにずらす（ランダム性だが再現性あり）
-      const phase = (i * 0.618) % 1; // 黄金角で分散
-      // 深さは「激しい線 = 大きく揺れる」
+      const phase = (i * 0.618) % 1;
       const depth = 0.3 + energy * 0.7;
-      // 慣性（感応の遅さ）は「穏やかな線 = ゆっくり反応」
       const inertia = 0.02 + (1 - energy) * 0.08;
-      traits[layer.id] = { energy, period, phase, depth, inertia };
+      // フィルター用: L/Rそれぞれ独立した周期・位相
+      const filterPeriodL = getLFOPeriod(durationRef.current, i + 1);
+      const filterPeriodR = getLFOPeriod(durationRef.current, i + 3);
+      const filterPhaseL = (i * 0.382) % 1;
+      const filterPhaseR = (i * 0.764) % 1;
+      // エネルギーが高い線 = Resonanceも高く・Cutoffの変動幅も大きく
+      const baseFilterFreq = 400 + energy * 2000; // 400Hz〜2400Hz
+      const resonance = 1 + energy * 15; // Q値 1〜16
+      traits[layer.id] = { energy, period, phase, depth, inertia, filterPeriodL, filterPeriodR, filterPhaseL, filterPhaseR, baseFilterFreq, resonance };
     });
     voiceTraitsRef.current = traits;
   }, []);
@@ -306,16 +311,53 @@ export default function GraphicScore() {
     layersRef.current.forEach(layer => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      const panner = ctx.createStereoPanner();
       osc.type = layer.waveform || "sine";
       gain.gain.value = 0;
-      panner.pan.value = layer.pan || 0;
-      osc.connect(gain);
-      gain.connect(panner);
-      panner.connect(ctx.destination);
-      panner.connect(dest); // 録音にも流す
-      osc.start();
-      oscsRef.current[layer.id] = { osc, gain, panner };
+
+      if (layer.filterOn) {
+        // ── 並列VCF L/R システム
+        // L側フィルター → パンL
+        const filterL = ctx.createBiquadFilter();
+        filterL.type = "lowpass";
+        filterL.frequency.value = 1200;
+        filterL.Q.value = 2;
+        const pannerL = ctx.createStereoPanner();
+        pannerL.pan.value = -1;
+
+        // R側フィルター → パンR
+        const filterR = ctx.createBiquadFilter();
+        filterR.type = "lowpass";
+        filterR.frequency.value = 800;
+        filterR.Q.value = 2;
+        const pannerR = ctx.createStereoPanner();
+        pannerR.pan.value = 1;
+
+        // gain → filterL → pannerL → dest
+        gain.connect(filterL);
+        filterL.connect(pannerL);
+        pannerL.connect(ctx.destination);
+        pannerL.connect(dest);
+
+        // gain → filterR → pannerR → dest
+        gain.connect(filterR);
+        filterR.connect(pannerR);
+        pannerR.connect(ctx.destination);
+        pannerR.connect(dest);
+
+        osc.connect(gain);
+        osc.start();
+        oscsRef.current[layer.id] = { osc, gain, filterL, filterR, pannerL, pannerR, hasFilter: true };
+      } else {
+        // ── 通常パス
+        const panner = ctx.createStereoPanner();
+        panner.pan.value = layer.pan || 0;
+        osc.connect(gain);
+        gain.connect(panner);
+        panner.connect(ctx.destination);
+        panner.connect(dest);
+        osc.start();
+        oscsRef.current[layer.id] = { osc, gain, panner, hasFilter: false };
+      }
     });
 
     startTimeRef.current = ctx.currentTime;
@@ -334,19 +376,49 @@ export default function GraphicScore() {
       layersRef.current.forEach(layer => {
         const voice = oscsRef.current[layer.id];
         if (!voice) return;
-        voice.panner.pan.setTargetAtTime(layer.pan || 0, ctx.currentTime, 0.05);
 
         const baseFreq = getFreqAtTime(layer.id, elapsed);
-        if (baseFreq) {
-          // LFOオフセットを加算
-          const lfoOffset = getLFOOffset(layer.id, elapsed);
-          const finalFreq = applyLFO(baseFreq, lfoOffset);
-          // 慣性（ボイスごとに異なる追従速度）
-          const inertia = traits[layer.id]?.inertia || 0.05;
-          voice.osc.frequency.setTargetAtTime(finalFreq, ctx.currentTime, inertia);
-          voice.gain.gain.setTargetAtTime(perVol, ctx.currentTime, 0.01);
+        const t = ctx.currentTime;
+        const tr = traits[layer.id];
+
+        if (voice.hasFilter) {
+          // ── 並列VCF L/R: CutoffとResonanceをLFOで独立制御
+          if (tr) {
+            const sens = lfoSensRef.current;
+            const lfoL = Math.sin((elapsed / tr.filterPeriodL + tr.filterPhaseL) * Math.PI * 2);
+            const lfoR = Math.sin((elapsed / tr.filterPeriodR + tr.filterPhaseR) * Math.PI * 2);
+            // Cutoff: base ± エネルギー × SENS × 変動幅
+            const cutoffL = Math.max(80, Math.min(18000, tr.baseFilterFreq + lfoL * tr.energy * sens * 1800));
+            const cutoffR = Math.max(80, Math.min(18000, tr.baseFilterFreq + lfoR * tr.energy * sens * 1800));
+            // Resonance: LFOで呼吸するように変動
+            const resL = Math.max(0.5, tr.resonance + lfoL * tr.energy * sens * 8);
+            const resR = Math.max(0.5, tr.resonance + lfoR * tr.energy * sens * 8);
+            voice.filterL.frequency.setTargetAtTime(cutoffL, t, 0.05);
+            voice.filterR.frequency.setTargetAtTime(cutoffR, t, 0.05);
+            voice.filterL.Q.setTargetAtTime(resL, t, 0.08);
+            voice.filterR.Q.setTargetAtTime(resR, t, 0.08);
+          }
+          if (baseFreq) {
+            const lfoOffset = getLFOOffset(layer.id, elapsed);
+            const finalFreq = applyLFO(baseFreq, lfoOffset);
+            const inertia = tr?.inertia || 0.05;
+            voice.osc.frequency.setTargetAtTime(finalFreq, t, inertia);
+            voice.gain.gain.setTargetAtTime(perVol * 1.4, t, 0.01); // 並列分岐で音量補正
+          } else {
+            voice.gain.gain.setTargetAtTime(0, t, 0.02);
+          }
         } else {
-          voice.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.02);
+          // ── 通常パス
+          voice.panner.pan.setTargetAtTime(layer.pan || 0, t, 0.05);
+          if (baseFreq) {
+            const lfoOffset = getLFOOffset(layer.id, elapsed);
+            const finalFreq = applyLFO(baseFreq, lfoOffset);
+            const inertia = tr?.inertia || 0.05;
+            voice.osc.frequency.setTargetAtTime(finalFreq, t, inertia);
+            voice.gain.gain.setTargetAtTime(perVol, t, 0.01);
+          } else {
+            voice.gain.gain.setTargetAtTime(0, t, 0.02);
+          }
         }
       });
 
@@ -436,6 +508,11 @@ export default function GraphicScore() {
   const toggleMute = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, muted: !l.muted } : l));
   const clearLayer = (id) => setLayers(prev => prev.map(l => l.id === id ? { ...l, strokes: [] } : l));
   const setWaveform = (id, wf) => setLayers(prev => prev.map(l => l.id === id ? { ...l, waveform: wf } : l));
+  const toggleFilter = (id) => {
+    setLayers(prev => { const next = prev.map(l => l.id === id ? { ...l, filterOn: !l.filterOn } : l); layersRef.current = next; return next; });
+    // 再生中なら再起動して音声グラフを再構築
+    if (playingRef.current) { stopPlay(); setTimeout(() => { startPlay(); setPlaying(true); }, 100); }
+  };
   const setPan = (id, pan) => {
     setLayers(prev => { const next = prev.map(l => l.id === id ? { ...l, pan } : l); layersRef.current = next; return next; });
   };
@@ -642,7 +719,8 @@ export default function GraphicScore() {
                     </>
                   )}
 
-                  <div style={{ display: "flex", gap: "3px" }}>
+                  {/* Mute / Clear / Remove */}
+                  <div style={{ display: "flex", gap: "3px", marginBottom: "3px" }}>
                     <button onClick={e => { e.stopPropagation(); toggleMute(layer.id); }}
                       style={{ flex: 1, padding: "2px 0", fontSize: "8px", border: "1px solid #222", borderRadius: "3px", background: layer.muted ? "#333" : "transparent", color: layer.muted ? "#fff" : "#444", cursor: "pointer", fontFamily: "inherit" }}>
                       {layer.muted ? "UN" : "M"}
@@ -658,6 +736,12 @@ export default function GraphicScore() {
                       </button>
                     )}
                   </div>
+                  {/* FILTER toggle */}
+                  <button onClick={e => { e.stopPropagation(); toggleFilter(layer.id); }}
+                    title="並列VCF L/R — CutoffとResonanceをLFOで独立制御"
+                    style={{ width: "100%", padding: "3px 0", fontSize: "8px", border: "1px solid", borderColor: layer.filterOn ? "#c77dff88" : "#222", borderRadius: "3px", background: layer.filterOn ? "#c77dff18" : "transparent", color: layer.filterOn ? "#c77dff" : "#333", cursor: "pointer", fontFamily: "'Share Tech Mono', monospace", letterSpacing: "1px", transition: "all 0.2s" }}>
+                    {layer.filterOn ? "⊛ VCF ON" : "⊙ VCF"}
+                  </button>
                 </div>
               );
             })}
